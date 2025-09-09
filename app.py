@@ -5,8 +5,8 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 
-st.set_page_config(page_title="書籍訂購（多人雲端版）", page_icon="📚", layout="centered")
-st.title("📚 書籍訂購表單（多人雲端版）")
+st.set_page_config(page_title="書籍訂購", page_icon="📚", layout="centered")
+st.title("📚 書籍訂購表單")
 
 # ---- 讀取資料庫連線（必填） ----
 if "DB_URL" not in st.secrets:
