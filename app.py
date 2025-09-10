@@ -1,15 +1,12 @@
-# app.py － 書籍訂購表單（多人雲端版＋CRUD＋統計）— 加速優化版
+# app.py － 書籍訂購表單（多人雲端版＋CRUD＋統計）— 修正版
 from datetime import datetime
 from decimal import Decimal
-from typing import List, Dict
-
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine, text, bindparam
+from sqlalchemy import create_engine, text
 
-# ---------------- 基本設定 ----------------
-st.set_page_config(page_title="書籍訂購（多人雲端版）", page_icon="📚", layout="wide")
-st.title("📚 書籍訂購表單（多人雲端版）")
+st.set_page_config(page_title="書籍訂購", page_icon="📚", layout="centered")
+st.title("📚 書籍訂購表單")
 
 # ---- 讀取資料庫連線（必填） ----
 if "DB_URL" not in st.secrets:
@@ -17,13 +14,7 @@ if "DB_URL" not in st.secrets:
     st.stop()
 
 DB_URL = st.secrets["DB_URL"]
-
-@st.cache_resource
-def get_engine():
-    # pool_pre_ping 避免閒置連線失效；pool_recycle 讓長連線定期重建
-    return create_engine(DB_URL, pool_pre_ping=True, pool_recycle=1800)
-
-engine = get_engine()
+engine = create_engine(DB_URL, pool_pre_ping=True)
 
 # ---- 常數：書籍選單與價格 ----
 BOOK_PRICES = {
@@ -32,7 +23,7 @@ BOOK_PRICES = {
 }
 OTHER_LABEL = "其他（自填）"
 
-# ---------------- 資料層：初始化 & CRUD ----------------
+# ---- DB 初始化與欄位升級（可重複執行，安全） ----
 def init_db():
     with engine.begin() as conn:
         conn.execute(text("""
@@ -61,7 +52,6 @@ def insert_order(name: str, qty: int, book_category: str, book_title: str, price
             {"n": name, "q": int(qty), "t": datetime.now(), "bc": book_category, "bt": book_title, "p": price, "note": note or ""}
         )
 
-@st.cache_data(ttl=5)
 def fetch_orders(limit: int = 500) -> pd.DataFrame:
     with engine.begin() as conn:
         df = pd.read_sql(
@@ -69,31 +59,24 @@ def fetch_orders(limit: int = 500) -> pd.DataFrame:
                     FROM orders ORDER BY id DESC LIMIT :lim"""),
             conn, params={"lim": limit}
         )
-    if df.empty:
-        return pd.DataFrame(columns=["id","name","qty","book_category","book_title","price","note","created_at","amount"])
-    # 型別轉換與金額
-    df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0)
-    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0).astype(int)
-    df["amount"] = (df["qty"] * df["price"]).astype(float)
+    if not df.empty:
+        df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0)
+        df["amount"] = df["qty"] * df["price"]
+    else:
+        df["amount"] = []
     return df
 
-def batch_apply(updates: List[Dict], delete_ids: List[int]):
-    """一次交易內完成多筆更新與刪除"""
+def update_qty(order_id: int, new_qty: int):
+    if new_qty < 1:
+        new_qty = 1
     with engine.begin() as conn:
-        # 1) 更新數量
-        if updates:
-            conn.execute(
-                text("UPDATE orders SET qty = :q WHERE id = :id"),
-                updates  # executemany
-            )
-        # 2) 刪除（expanding IN）
-        if delete_ids:
-            stmt = text("DELETE FROM orders WHERE id IN :ids").bindparams(
-                bindparam("ids", expanding=True)
-            )
-            conn.execute(stmt, {"ids": delete_ids})
+        conn.execute(text("UPDATE orders SET qty = :q WHERE id = :id"), {"q": int(new_qty), "id": int(order_id)})
 
-# ---------------- 初始化 ----------------
+def delete_order(order_id: int):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM orders WHERE id = :id"), {"id": int(order_id)})
+
+# ---- 初始化 ----
 try:
     init_db()
 except Exception as e:
@@ -101,45 +84,51 @@ except Exception as e:
     st.stop()
 
 # =========================
-# 建單區（使用 form，避免每次輸入都重跑）
+# 建單區（即時互動，非 form）
 # =========================
 st.subheader("新增訂單")
 
-with st.form("create_order_form", clear_on_submit=True):
-    name = st.text_input("訂購人姓名", max_chars=50, placeholder="請輸入姓名")
+# 1) 基本資料
+name = st.text_input("訂購人姓名", max_chars=50, placeholder="請輸入姓名")
 
-    # 書籍選擇（radio，不用下拉）
-    choice = st.radio("選擇書籍", list(BOOK_PRICES.keys()) + [OTHER_LABEL], horizontal=True)
+# 2) 書籍選擇（radio，不用下拉）
+choice = st.radio("選擇書籍", list(BOOK_PRICES.keys()) + [OTHER_LABEL])
 
-    if choice == OTHER_LABEL:
-        # 立刻顯示其他欄位（在 form 內不會造成多次 rerun）
-        title = st.text_input("其他選項：書名", max_chars=100, placeholder="請輸入書名")
-        other_price = st.number_input("其他選項：價格（數字）", min_value=0.0, step=1.0, value=0.0)
-        price = Decimal(str(other_price))
-        category = "其他選項"
-    else:
-        show_price = float(BOOK_PRICES[choice])
-        st.number_input("單價（唯讀）", value=show_price, disabled=True)
-        price = BOOK_PRICES[choice]
-        title = choice
-        category = choice
+# 3) 價格/其他欄位
+if choice == OTHER_LABEL:
+    # 固定顯示其他欄位（可輸入）
+    other_title = st.text_input("其他選項：書名", max_chars=100, placeholder="請輸入書名")
+    other_price = st.number_input("其他選項：價格（數字）", min_value=0.0, step=1.0, value=0.0)
+    price = Decimal(str(other_price))
+    title = other_title.strip()
+    category = "其他選項"
+else:
+    # 顯示單價（唯讀）
+    show_price = float(BOOK_PRICES[choice])
+    st.number_input("單價", value=show_price, disabled=True)
+    price = BOOK_PRICES[choice]
+    title = choice
+    category = choice
 
-    qty = st.number_input("數量", min_value=1, step=1, value=1)
-    note = st.text_area("備註（可留空）", max_chars=300, placeholder="可輸入備註…")
+qty = st.number_input("數量", min_value=1, step=1, value=1)
+note = st.text_area("備註（可留空）", max_chars=300, placeholder="可輸入備註…")
 
-    submitted = st.form_submit_button("➕ 送出訂單", use_container_width=True)
-
-if submitted:
-    clean_name = (name or "").strip()
+if st.button("送出訂單", use_container_width=True):
+    clean_name = name.strip()
     if not clean_name:
         st.error("姓名不可為空白。")
-    elif choice == OTHER_LABEL and (not title.strip() or price <= 0):
-        st.error("請輸入『其他選項』的書名與正確價格（> 0）。")
     else:
+        if choice == OTHER_LABEL:
+            if not title:
+                st.error("請輸入『其他選項』的書名。")
+                st.stop()
+            if price <= 0:
+                st.error("請輸入正確的『其他選項』價格（> 0）。")
+                st.stop()
         try:
-            insert_order(clean_name, int(qty), category, title.strip(), price, note)
+            insert_order(clean_name, int(qty), category, title, price, note)
+            # 顯示成功後重刷頁面，清乾淨欄位＋更新列表
             st.success("訂單已送出！")
-            st.cache_data.clear()
             st.rerun()
         except Exception as e:
             st.error(f"寫入失敗：{e}")
@@ -147,7 +136,7 @@ if submitted:
 st.divider()
 
 # =========================
-# 訂單列表（批次調整數量／批次刪除）
+# 訂單列表（可刪除、調整數量）
 # =========================
 st.subheader("訂單列表")
 df = fetch_orders(limit=500)
@@ -155,61 +144,44 @@ df = fetch_orders(limit=500)
 if df.empty:
     st.info("目前沒有訂單。")
 else:
-    # 顯示用 DataFrame
-    view_df = df[["id","created_at","name","book_category","book_title","price","qty","amount","note"]].copy()
-    view_df["price"] = view_df["price"].astype(float)
-    view_df["amount"] = view_df["amount"].astype(float)
-
-    # 加一個刪除勾選欄
-    view_df.insert(1, "刪除", False)
-
-    edited = st.data_editor(
-        view_df,
-        use_container_width=True,
-        height=420,
-        num_rows="fixed",
-        column_config={
-            "id": st.column_config.NumberColumn("ID", disabled=True),
-            "刪除": st.column_config.CheckboxColumn("刪除"),
-            "created_at": st.column_config.DatetimeColumn("建立時間", disabled=True),
-            "name": st.column_config.TextColumn("訂購人", disabled=True),
-            "book_category": st.column_config.TextColumn("類別", disabled=True),
-            "book_title": st.column_config.TextColumn("書名", disabled=True),
-            "price": st.column_config.NumberColumn("單價", step=1, disabled=True),
-            "qty": st.column_config.NumberColumn("數量", step=1, min_value=1),
-            "amount": st.column_config.NumberColumn("小計", disabled=True),
-            "note": st.column_config.TextColumn("備註", disabled=True),
-        },
-        key="orders_editor"
-    )
-
-    # 計算「有變動的數量」與「需要刪除的 id」
-    # 1) 刪除
-    delete_ids = edited.loc[edited["刪除"] == True, "id"].astype(int).tolist()
-
-    # 2) 數量變更（比對原始 df）
-    merged = edited[["id","qty"]].merge(df[["id","qty"]], on="id", how="left", suffixes=("_new","_old"))
-    changed = merged[merged["qty_new"].astype(int) != merged["qty_old"].astype(int)]
-    updates = [{"id": int(row.id), "q": int(row.qty_new)} for row in changed.itertuples(index=False)]
-
-    colA, colB = st.columns([1,3])
-    with colA:
-        apply_clicked = st.button("🚀 套用變更", type="primary", use_container_width=True)
-    with colB:
-        st.caption(f"待更新數量：{len(updates)}　|　待刪除筆數：{len(delete_ids)}")
-
-    if apply_clicked:
-        try:
-            batch_apply(updates, delete_ids)
-            st.success("已完成套用。重新載入最新資料…")
-            st.cache_data.clear()
-            st.rerun()
-        except Exception as e:
-            st.error(f"套用失敗：{e}")
+    for _, row in df.iterrows():
+        col1, col2, col3, col4, col5, col6, col7 = st.columns([2, 2, 3, 2, 2, 3, 2])
+        with col1:
+            st.text(f"#{int(row['id'])}")
+            st.caption(row["created_at"])
+        with col2:
+            st.text(row["name"])
+            st.caption(row["book_category"])
+        with col3:
+            st.text(row["book_title"])
+            st.caption(f"單價：{Decimal(row['price']):.0f}")
+        with col4:
+            new_qty = st.number_input(
+                "數量", min_value=1, step=1, value=int(row["qty"]),
+                key=f"qty_{int(row['id'])}", label_visibility="collapsed"
+            )
+        with col5:
+            if st.button("更新數量", key=f"upd_{int(row['id'])}"):
+                try:
+                    update_qty(int(row["id"]), int(new_qty))
+                    st.rerun()  # 直接重繪，避免殘留訊息
+                except Exception as e:
+                    st.error(f"更新失敗：{e}")
+        with col6:
+            st.text(f"小計：{Decimal(row['amount']):.0f}")
+            if str(row.get("note", "")).strip():
+                st.caption(f"備註：{row['note']}")
+        with col7:
+            if st.button("🗑 刪除", key=f"del_{int(row['id'])}"):
+                try:
+                    delete_order(int(row["id"]))
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"刪除失敗：{e}")
 
     st.divider()
 
-    # ---- 統計 ----
+    # ---- 統計：各書籍數量與金額、以及總金額 ----
     st.subheader("統計")
     agg = (
         df.groupby("book_title", dropna=False)
@@ -218,15 +190,15 @@ else:
           .reset_index()
           .sort_values("book_title")
     )
-    agg["總金額"] = agg["總金額"].round(0).astype(int).astype(str)
+    agg["總金額"] = agg["總金額"].apply(lambda x: f"{Decimal(x):.0f}")
     st.dataframe(agg, use_container_width=True)
 
-    total_amount = float(df["amount"].sum())
+    total_amount = Decimal(df["amount"].sum())
     st.metric(label="全部書籍的總金額", value=f"{total_amount:.0f}")
 
     export_df = df.copy()
-    export_df["price"] = export_df["price"].round(0).astype(int)
-    export_df["amount"] = export_df["amount"].round(0).astype(int)
+    export_df["price"] = export_df["price"].apply(lambda x: f"{Decimal(x):.0f}")
+    export_df["amount"] = export_df["amount"].apply(lambda x: f"{Decimal(x):.0f}")
     st.download_button(
         "下載目前訂單（CSV）",
         export_df.to_csv(index=False).encode("utf-8-sig"),
